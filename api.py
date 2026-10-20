@@ -1,7 +1,8 @@
-import base64, json, gzip, httpx, os
+import base64, json, gzip, httpx, os, re
+from urllib.parse import quote, urljoin
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
@@ -81,6 +82,162 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         data = _decode_pipe_response(res.text.strip())
         _deep_translate(data)
         return data
+
+
+# ---------------------------------------------------------------------------
+# Catalogue Miruro (/api/v1)
+#
+# Miruro moved its catalogue to /api/v1 and its player to strm.cx. The
+# answers come back as "application/octet-stream": gzip bytes xor-ed with the
+# repeating key "miruro/catalog", exactly like the site does it.
+# ---------------------------------------------------------------------------
+
+CATALOG_BASE = "https://www.miruro.tv/api/v1"
+CATALOG_KEY = b"miruro/catalog"
+
+
+async def _catalog_get(path: str) -> dict:
+    """One catalogue call, decoded."""
+    async with AsyncSession(impersonate="chrome110") as client:
+        res = await client.get(f"{CATALOG_BASE}{path}", headers=HEADERS)
+        if res.status_code != 200:
+            raise HTTPException(
+                status_code=res.status_code,
+                detail={"status": res.status_code, "body": res.text[:300]},
+            )
+        raw = bytearray(res.content)
+        if "octet-stream" in res.headers.get("content-type", ""):
+            for i in range(len(raw)):
+                raw[i] ^= CATALOG_KEY[i % len(CATALOG_KEY)]
+            raw = gzip.decompress(bytes(raw))
+        return json.loads(raw.decode("utf-8"))
+
+
+async def _catalog_anime_id(anilist_id: int) -> str:
+    """The catalogue's own id for an AniList id.
+
+    The catalogue only accepts the queries the site itself sends (a title
+    search, a schedule, an internal id), so the AniList id is turned into a
+    title first -- AniList knows the title, the catalogue answers with the
+    entry, and the entry carries `external_ids.anilist`.
+    """
+    data = await _anilist_query(
+        "query ($id: Int) { Media(id: $id) { title { romaji english native } } }",
+        {"id": anilist_id},
+    )
+    titles = (data.get("Media") or {}).get("title") or {}
+    title = titles.get("english") or titles.get("romaji") or titles.get("native")
+    if not title:
+        raise HTTPException(status_code=404, detail="Title not found on AniList")
+
+    result = await _catalog_get(f"/anime?q={quote(title)}&limit=15&sort=-popularity")
+    for entry in result.get("data", []):
+        ids = (entry.get("external_ids") or {}).get("anilist") or []
+        if str(anilist_id) in [str(i) for i in ids]:
+            return entry["id"]
+    raise HTTPException(status_code=404, detail=f"No catalogue entry for AniList {anilist_id}")
+
+
+async def _catalog_episodes(internal_id: str) -> list:
+    data = await _catalog_get(f"/anime/{internal_id}/episodes?limit=10000")
+    return data.get("data", [])
+
+
+async def _catalog_play(internal_id: str, episode: int) -> dict:
+    return await _catalog_get(f"/anime/{internal_id}/episodes/{episode}/play")
+
+
+# ---------------------------------------------------------------------------
+# Proxy HLS
+#
+# Les CDN de Miruro refusent deux choses : une requete sans le bon Referer,
+# et une empreinte TLS qui n'est pas celle d'un navigateur. C'est curl_cffi
+# qui passe les deux -- Node, lui, ne sait pas imiter Chrome. Le proxy vit
+# donc ici, et les URI d'une playlist (segments, cle, variante) sont
+# reecrites pour repasser par lui.
+# ---------------------------------------------------------------------------
+
+def _b64e(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+
+
+def _b64d(value: str) -> str:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
+
+
+def _proxy_url(url: str, headers: dict) -> str:
+    return f"/stream?u={_b64e(url)}&h={_b64e(json.dumps(headers))}"
+
+
+def _rewrite_playlist(text: str, base_url: str, headers: dict) -> str:
+    """Reecrit les URI d'une playlist pour qu'elles repassent par le proxy."""
+    out = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            # Les URI citees dans les etiquettes (#EXT-X-KEY, #EXT-X-MEDIA).
+            def _tag(match):
+                url = match.group(1)
+                absolute = urljoin(base_url, url)
+                return 'URI="%s"' % _proxy_url(absolute, headers)
+
+            out.append(re.sub(r'URI="([^"]+)"', _tag, line))
+            continue
+        absolute = urljoin(base_url, stripped)
+        out.append(_proxy_url(absolute, headers))
+    return "\n".join(out)
+
+
+@app.get("/stream")
+async def stream_proxy(
+    u: str = Query(..., description="URL absolue, encodee en base64url"),
+    h: str = Query("", description="Headers (JSON), encodes en base64url"),
+):
+    """Un segment ou une playlist HLS, tel que le CDN les veut.
+
+    `u` porte l'URL a recuperer, `h` les headers qu'elle exige (le Referer
+    du CDN). Les reponses qui sont des playlists ont leurs URI reecrites.
+    """
+    try:
+        url = _b64d(u)
+    except Exception:
+        raise HTTPException(status_code=400, detail="URL invalide")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Only http(s) is proxied")
+
+    headers = {}
+    if h:
+        try:
+            headers = json.loads(_b64d(h))
+        except Exception:
+            headers = {}
+
+    try:
+        async with AsyncSession(impersonate="chrome110") as client:
+            res = await client.get(url, headers=headers)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream unreachable: {exc}")
+
+    if res.status_code >= 400:
+        raise HTTPException(status_code=res.status_code, detail=res.text[:200])
+
+    body = res.content
+    content_type = res.headers.get("content-type", "")
+    if "mpegurl" in content_type or body[:7] == b"#EXTM3U":
+        text = _rewrite_playlist(body.decode("utf-8", "replace"), url, headers)
+        return Response(
+            content=text,
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-store"},
+        )
+    return Response(
+        content=body,
+        media_type=content_type or "video/mp2t",
+        headers={"Cache-Control": "max-age=3600"},
+    )
 
 MEDIA_LIST_FIELDS = """
     id
@@ -987,8 +1144,42 @@ async def get_anime_recommendations(
 
 @app.get("/episodes/{anilist_id}")
 async def get_episodes(anilist_id: int):
-    data = await _fetch_raw_episodes(anilist_id)
-    return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
+    """Episodes of an anime, by provider and by audio type.
+
+    Miruro moved its catalogue to /api/v1 (answers gzipped then xor-ed with
+    "miruro/catalog") and its player to strm.cx; the old "pipe" still answers
+    the metadata but its "sources" path is a 404 since. The catalogue is the
+    source of truth now, and the pipe is kept as a fallback.
+    """
+    try:
+        internal_id = await _catalog_anime_id(anilist_id)
+    except HTTPException:
+        data = await _fetch_raw_episodes(anilist_id)
+        return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
+
+    episodes = await _catalog_episodes(internal_id)
+    listed = []
+    for ep in episodes:
+        number = ep.get("episode_number")
+        if number is None:
+            continue
+        listed.append({
+            "id": f"watch/miruro/{anilist_id}/sub/{number}",
+            "number": number,
+            "title": ep.get("title") or f"Episode {number}",
+            "image": ep.get("thumbnail_url"),
+            "airDate": ep.get("aired_on"),
+            "duration": ep.get("duration_seconds") or 0,
+            "description": ep.get("synopsis"),
+            "filler": ep.get("kind") not in ("regular", None),
+            "skipTimes": ep.get("skip_times") or [],
+        })
+
+    return {
+        "mappings": {"anilistId": anilist_id, "internalId": internal_id},
+        "providers": {"miruro": {"episodes": {"sub": listed}}},
+        "episodes": listed,
+    }
 
 @app.get("/sources")
 async def get_sources(
@@ -1019,20 +1210,59 @@ async def get_sources(
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
-    data = await _fetch_raw_episodes(anilist_id)
-    prov_data = data.get("providers", {}).get(provider, {})
-    ep_list = prov_data.get("episodes", {}).get(category, [])
-    
-    target_id = None
-    for ep in ep_list:
-        orig_id = ep.get("id", "")
-        prefix = orig_id.split(":")[0] if ":" in orig_id else orig_id
-        generated = f"{prefix}-{ep.get('number')}"
-        if generated == slug:
-            target_id = orig_id
-            break
-            
-    if not target_id:
-        raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
-        
-    return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
+    """The playable streams of one episode.
+
+    `slug` is the episode number, as handed out by /episodes. The old pipe
+    answered this with a m3u8 URL; the catalogue answers it with the servers
+    (and the headers they demand -- the CDN refuses a request without the
+    right Referer), so the headers travel with the answer.
+    """
+    try:
+        episode = int(slug)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Episode number expected")
+
+    internal_id = await _catalog_anime_id(anilist_id)
+    play = await _catalog_play(internal_id, episode)
+
+    streams = []
+    subtitles = []
+    headers = {}
+    for track in play.get("tracks", []):
+        if category and track.get("track") not in (category, None):
+            continue
+        for prov in track.get("providers", []):
+            for server in prov.get("servers", []):
+                server_headers = server.get("headers") or {}
+                headers.update(server_headers)
+                for st in server.get("streams", []):
+                    streams.append({
+                        "url": st.get("url"),
+                        "type": st.get("format") or "hls",
+                        "quality": st.get("quality") or "",
+                        "resolution": st.get("resolution"),
+                        "headers": server_headers,
+                    })
+            for sub in prov.get("subtitles", []):
+                subtitles.append(sub)
+
+    intro = outro = None
+    for ep in await _catalog_episodes(internal_id):
+        if ep.get("episode_number") != episode:
+            continue
+        for skip in ep.get("skip_times") or []:
+            kind = skip.get("kind")
+            if kind in ("op", "mixed_op") and intro is None:
+                intro = {"start": skip.get("start_seconds"), "end": skip.get("end_seconds")}
+            if kind == "ed" and outro is None:
+                outro = {"start": skip.get("start_seconds"), "end": skip.get("end_seconds")}
+        break
+
+    return {
+        "streams": streams,
+        "subtitles": subtitles,
+        "intro": intro,
+        "outro": outro,
+        "headers": headers,
+        "episodeNumber": episode,
+    }
