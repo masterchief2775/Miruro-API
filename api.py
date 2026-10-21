@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os, re
+import base64, json, gzip, httpx, os, re, time
 from urllib.parse import quote, urljoin
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Query
@@ -95,9 +95,36 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
 CATALOG_BASE = "https://www.miruro.tv/api/v1"
 CATALOG_KEY = b"miruro/catalog"
 
+# The catalogue is slow: the same title was measured between 3 and 33
+# seconds, with failures in between. A title's identity and its episode list
+# change once a week, so they are kept for a few minutes. The PLAY answer is
+# NOT cached: it carries signed URLs, and a stale one is a dead stream.
+_CATALOG_CACHE = {}
+_CATALOG_CACHE_TTL = 300  # seconds
 
-async def _catalog_get(path: str) -> dict:
+
+def _cache_get(key: str):
+    entry = _CATALOG_CACHE.get(key)
+    if entry is None:
+        return None
+    expires, value = entry
+    if expires < time.time():
+        _CATALOG_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value):
+    _CATALOG_CACHE[key] = (time.time() + _CATALOG_CACHE_TTL, value)
+    return value
+
+
+async def _catalog_get(path: str, cache: bool = True) -> dict:
     """One catalogue call, decoded."""
+    if cache:
+        hit = _cache_get(path)
+        if hit is not None:
+            return hit
     async with AsyncSession(impersonate="chrome110") as client:
         res = await client.get(f"{CATALOG_BASE}{path}", headers=HEADERS)
         if res.status_code != 200:
@@ -110,7 +137,10 @@ async def _catalog_get(path: str) -> dict:
             for i in range(len(raw)):
                 raw[i] ^= CATALOG_KEY[i % len(CATALOG_KEY)]
             raw = gzip.decompress(bytes(raw))
-        return json.loads(raw.decode("utf-8"))
+        decoded = json.loads(raw.decode("utf-8"))
+        if cache:
+            _cache_set(path, decoded)
+        return decoded
 
 
 async def _catalog_anime_id(anilist_id: int) -> str:
@@ -144,7 +174,9 @@ async def _catalog_episodes(internal_id: str) -> list:
 
 
 async def _catalog_play(internal_id: str, episode: int) -> dict:
-    return await _catalog_get(f"/anime/{internal_id}/episodes/{episode}/play")
+    # Not cached: the answer carries signed URLs, and a stale one is a dead
+    # stream.
+    return await _catalog_get(f"/anime/{internal_id}/episodes/{episode}/play", cache=False)
 
 
 # ---------------------------------------------------------------------------
