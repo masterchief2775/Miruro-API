@@ -143,20 +143,34 @@ async def _catalog_get(path: str, cache: bool = True) -> dict:
         return decoded
 
 
-async def _catalog_anime_id(anilist_id: int) -> str:
+async def _catalog_anime_id(anilist_id: int, title: str | None = None) -> str:
     """The catalogue's own id for an AniList id.
 
     The catalogue only accepts the queries the site itself sends (a title
     search, a schedule, an internal id), so the AniList id is turned into a
     title first -- AniList knows the title, the catalogue answers with the
     entry, and the entry carries `external_ids.anilist`.
+
+    Three ways to get that title, in order:
+
+    1. the cache: the mapping never changes, and it is kept on disk;
+    2. the caller: the application knows the title of every title in the
+       watchlist, and sending it means a refusal from AniList cannot empty
+       the catalogue (which happened on 21 October 2026: the source, the
+       application and the browser all failed for the same reason);
+    3. AniList itself, as a last resort.
     """
-    data = await _anilist_query(
-        "query ($id: Int) { Media(id: $id) { title { romaji english native } } }",
-        {"id": anilist_id},
-    )
-    titles = (data.get("Media") or {}).get("title") or {}
-    title = titles.get("english") or titles.get("romaji") or titles.get("native")
+    cached = _anilist_id_cache_get(anilist_id)
+    if cached:
+        return cached
+
+    if not title:
+        data = await _anilist_query(
+            "query ($id: Int) { Media(id: $id) { title { romaji english native } } }",
+            {"id": anilist_id},
+        )
+        titles = (data.get("Media") or {}).get("title") or {}
+        title = titles.get("english") or titles.get("romaji") or titles.get("native")
     if not title:
         raise HTTPException(status_code=404, detail="Title not found on AniList")
 
@@ -164,6 +178,7 @@ async def _catalog_anime_id(anilist_id: int) -> str:
     for entry in result.get("data", []):
         ids = (entry.get("external_ids") or {}).get("anilist") or []
         if str(anilist_id) in [str(i) for i in ids]:
+            _anilist_id_cache_set(anilist_id, entry["id"])
             return entry["id"]
     raise HTTPException(status_code=404, detail=f"No catalogue entry for AniList {anilist_id}")
 
@@ -419,6 +434,71 @@ async def _anilist_query(query: str, variables: dict = None):
         if res.status_code != 200:
             raise HTTPException(status_code=500, detail="AniList query failed")
         return res.json().get("data", {})
+
+
+# ---------------------------------------------------------------------------
+# AniList id -> catalogue id
+#
+# The catalogue only knows its own ids, so the AniList id has to be turned
+# into a title first, and AniList is asked for that title. But the mapping
+# NEVER changes: an AniList id designates the same entry of the catalogue
+# forever.
+#
+# So it is kept, on disk, for a long time. AniList limits the requests per
+# address and refuses the address beyond that: without this cache, one
+# refusal emptied the whole catalogue and no episode could be watched -- the
+# source, the application and the browser all failing for the same reason.
+# ---------------------------------------------------------------------------
+
+ANILIST_ID_CACHE_TTL = 30 * 24 * 3600  # 30 jours
+ANILIST_ID_CACHE_PATH = os.environ.get(
+    "ANILIST_ID_CACHE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "anilist-id-cache.json"),
+)
+
+_anilist_id_cache = {}
+
+
+def _load_anilist_id_cache():
+    try:
+        with open(ANILIST_ID_CACHE_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        now = time.time()
+        for key, value in (raw or {}).items():
+            at = value.get("at", 0)
+            if now - at < ANILIST_ID_CACHE_TTL:
+                _anilist_id_cache[str(key)] = value
+    except Exception:
+        pass
+
+
+def _save_anilist_id_cache():
+    try:
+        tmp = ANILIST_ID_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_anilist_id_cache, fh)
+        os.replace(tmp, ANILIST_ID_CACHE_PATH)
+    except Exception:
+        # The cache is an optimisation, never a reason to fail.
+        pass
+
+
+def _anilist_id_cache_get(anilist_id: int):
+    entry = _anilist_id_cache.get(str(anilist_id))
+    if not entry:
+        return None
+    if time.time() - entry.get("at", 0) > ANILIST_ID_CACHE_TTL:
+        _anilist_id_cache.pop(str(anilist_id), None)
+        return None
+    return entry.get("internal_id")
+
+
+def _anilist_id_cache_set(anilist_id: int, internal_id: str):
+    _anilist_id_cache[str(anilist_id)] = {"internal_id": internal_id, "at": time.time()}
+    _save_anilist_id_cache()
+
+
+_load_anilist_id_cache()
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -1175,16 +1255,20 @@ async def get_anime_recommendations(
     return _proxy_deep_images(response)
 
 @app.get("/episodes/{anilist_id}")
-async def get_episodes(anilist_id: int):
+async def get_episodes(anilist_id: int, title: Optional[str] = Query(None)):
     """Episodes of an anime, by provider and by audio type.
 
     Miruro moved its catalogue to /api/v1 (answers gzipped then xor-ed with
     "miruro/catalog") and its player to strm.cx; the old "pipe" still answers
     the metadata but its "sources" path is a 404 since. The catalogue is the
     source of truth now, and the pipe is kept as a fallback.
+
+    `title` is optional and only a shortcut: it is the title the caller
+    already knows, and passing it means the catalogue can be resolved
+    without asking AniList anything.
     """
     try:
-        internal_id = await _catalog_anime_id(anilist_id)
+        internal_id = await _catalog_anime_id(anilist_id, title)
     except HTTPException:
         data = await _fetch_raw_episodes(anilist_id)
         return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
@@ -1241,20 +1325,29 @@ async def get_sources(
         return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
-async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
+async def get_watch_sources(
+    provider: str,
+    anilist_id: int,
+    category: str,
+    slug: str,
+    title: Optional[str] = Query(None),
+):
     """The playable streams of one episode.
 
     `slug` is the episode number, as handed out by /episodes. The old pipe
     answered this with a m3u8 URL; the catalogue answers it with the servers
     (and the headers they demand -- the CDN refuses a request without the
     right Referer), so the headers travel with the answer.
+
+    `title` is optional and only a shortcut: the catalogue can be resolved
+    without asking AniList anything when the caller already knows the title.
     """
     try:
         episode = int(slug)
     except ValueError:
         raise HTTPException(status_code=400, detail="Episode number expected")
 
-    internal_id = await _catalog_anime_id(anilist_id)
+    internal_id = await _catalog_anime_id(anilist_id, title)
     play = await _catalog_play(internal_id, episode)
 
     streams = []
