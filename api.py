@@ -432,8 +432,32 @@ async def _anilist_query(query: str, variables: dict = None):
     async with httpx.AsyncClient(timeout=15.0) as client:
         res = await client.post(ANILIST_URL, json=body)
         if res.status_code != 200:
-            raise HTTPException(status_code=500, detail="AniList query failed")
+            # AniList's own words, kept: it says when its API is disabled
+            # ("temporarily disabled due to severe stability issues"), and that
+            # is the difference between "come back later" and "this title is
+            # not in the catalogue". Throwing it away turned a precise
+            # message into a vague one.
+            raise HTTPException(
+                status_code=res.status_code,
+                detail={
+                    "status": res.status_code,
+                    "message": _anilist_error_message(res),
+                },
+            )
         return res.json().get("data", {})
+
+
+def _anilist_error_message(res) -> str:
+    """What AniList said, in one line."""
+    try:
+        payload = res.json()
+        errors = payload.get("errors") or []
+        if errors and errors[0].get("message"):
+            return str(errors[0]["message"])
+    except Exception:
+        pass
+    text = (res.text or "").strip()
+    return text[:200] or f"AniList a repondu {res.status_code}"
 
 
 # ---------------------------------------------------------------------------
@@ -1269,7 +1293,16 @@ async def get_episodes(anilist_id: int, title: Optional[str] = Query(None)):
     """
     try:
         internal_id = await _catalog_anime_id(anilist_id, title)
-    except HTTPException:
+    except HTTPException as err:
+        # The old pipe is a fallback for the titles the catalogue does not
+        # know. But when AniList itself refuses -- it disabled its API on
+        # 21 October 2026 -- the pipe's answer is a 404 page, and the real
+        # reason is AniList's own message. Swallowing it turned a precise
+        # answer into "this title does not exist".
+        detail = getattr(err, "detail", None)
+        status = detail.get("status") if isinstance(detail, dict) else None
+        if status in (403, 429, 500, 502, 503):
+            raise
         data = await _fetch_raw_episodes(anilist_id)
         return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
 
