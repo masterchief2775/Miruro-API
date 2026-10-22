@@ -874,6 +874,58 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
 </body>
 </html>"""
 
+@app.get("/catalogue/search")
+async def catalogue_search(
+    query: str = Query(..., description="Titre recherche, en clair"),
+    limit: int = Query(25, ge=1, le=100),
+):
+    """Recherche dans le catalogue, SANS passer par AniList.
+
+    Le catalogue porte les identifiants AniList de chaque entree
+    (`external_ids.anilist`), donc les reponses sont utilisables telles
+    quelles par l'application : pas de table de correspondance, pas de
+    conversion d'identifiants.
+
+    C'est le repli quand AniList est indisponible -- il l'a ete le 21
+    octobre 2026, toute l'API etant desactivee pour des problemes de
+    stabilite. Les routes habituelles (/search, /trending) passent, elles,
+    par AniList pour resoudre les identifiants : elles tombent avec lui.
+    """
+    try:
+        result = await _catalog_get(f"/anime?q={quote(query)}&limit={limit}&sort=-popularity")
+    except HTTPException as err:
+        raise HTTPException(status_code=502, detail={"message": "Le catalogue ne repond pas"})
+
+    entries = []
+    for entry in result.get("data", []):
+        anilist_ids = (entry.get("external_ids") or {}).get("anilist") or []
+        if not anilist_ids:
+            continue
+        entries.append(
+            {
+                "anilistId": int(anilist_ids[0]),
+                "id": entry.get("id"),
+                "title": entry.get("title"),
+                "titles": entry.get("titles") or [],
+                "coverImage": entry.get("coverImage") or entry.get("image"),
+                "bannerImage": entry.get("bannerImage"),
+                "description": entry.get("description"),
+                "format": entry.get("format"),
+                "status": entry.get("status"),
+                "episodes": entry.get("episodes"),
+                "duration": entry.get("duration"),
+                "genres": entry.get("genres") or [],
+                "tags": entry.get("tags") or [],
+                "year": entry.get("year"),
+                "averageScore": entry.get("averageScore"),
+                "popularity": entry.get("popularity"),
+                "season": entry.get("season"),
+                "nextAiring": entry.get("nextAiring"),
+            }
+        )
+    return {"data": entries, "count": entries.__len__(), "catalogue": "miruro"}
+
+
 @app.get("/search")
 async def search_anime(
     query: str,
