@@ -939,11 +939,11 @@ async def catalogue_search(
     """
     try:
         # The catalogue refuses a query without `limit` ("Unsupported catalog
-        # request"), and it seems to want more than a handful: the same URL
-        # with limit=3 answers 400 and with limit=15 answers 200. The limit
-        # asked for is applied afterwards.
-        wanted = max(1, min(limit, 15))
-        path = f"/anime?limit={wanted}&sort={quote(sort)}"
+        # request"), and it refuses a limit that is too small: the same URL
+        # with limit=3 answers 400 and with limit=15 answers 200. So the
+        # catalogue is ALWAYS asked for fifteen -- the most it gives -- and the
+        # answer is trimmed afterwards.
+        path = f"/anime?limit=15&sort={quote(sort)}"
         if query:
             path += f"&q={quote(query)}"
         if season:
