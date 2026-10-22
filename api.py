@@ -876,8 +876,11 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
 
 @app.get("/catalogue/search")
 async def catalogue_search(
-    query: str = Query(..., description="Titre recherche, en clair"),
-    limit: int = Query(25, ge=1, le=100),
+    query: str = Query("", description="Titre recherche, en clair (vide = tout le catalogue)"),
+    limit: int = Query(15, ge=1, le=15),
+    season: str = Query("", description="Saison, en majuscules (FALL, SPRING, SUMMER, WINTER)"),
+    season_year: int = Query(0, ge=0, le=2100),
+    sort: str = Query("-popularity"),
 ):
     """Recherche dans le catalogue, SANS passer par AniList.
 
@@ -890,13 +893,24 @@ async def catalogue_search(
     octobre 2026, toute l'API etant desactivee pour des problemes de
     stabilite. Les routes habituelles (/search, /trending) passent, elles,
     par AniList pour resoudre les identifiants : elles tombent avec lui.
+
+    Le catalogue refuse une requete sans `limit` ("Unsupported catalog
+    request"), et il en veut au plus quinze : au-dela, il repond 400.
     """
     try:
         # The catalogue refuses a query without `limit` ("Unsupported catalog
         # request"), and it seems to want more than a handful: the same URL
         # with limit=3 answers 400 and with limit=15 answers 200. The limit
         # asked for is applied afterwards.
-        result = await _catalog_get(f"/anime?q={quote(query)}&limit=15&sort=-popularity")
+        wanted = max(1, min(limit, 15))
+        path = f"/anime?limit={wanted}&sort={quote(sort)}"
+        if query:
+            path += f"&q={quote(query)}"
+        if season:
+            path += f"&season={quote(season.upper())}"
+        if season_year:
+            path += f"&season_year={season_year}"
+        result = await _catalog_get(path)
     except HTTPException:
         raise HTTPException(status_code=502, detail={"message": "Le catalogue ne repond pas"})
 
@@ -905,29 +919,38 @@ async def catalogue_search(
         anilist_ids = (entry.get("external_ids") or {}).get("anilist") or []
         if not anilist_ids:
             continue
+        title = entry.get("title") or {}
+        minutes = entry.get("episode_duration_minutes")
         entries.append(
             {
                 "anilistId": int(anilist_ids[0]),
                 "id": entry.get("id"),
-                "title": entry.get("title"),
-                "titles": entry.get("titles") or [],
-                "coverImage": entry.get("coverImage") or entry.get("image"),
-                "bannerImage": entry.get("bannerImage"),
+                "title": {
+                    "romaji": title.get("romaji"),
+                    "english": title.get("english"),
+                    "native": title.get("native"),
+                },
+                "coverImage": entry.get("cover_url"),
+                "bannerImage": entry.get("banner_url"),
+                "backgroundImage": entry.get("background_url"),
                 "description": entry.get("description"),
                 "format": entry.get("format"),
                 "status": entry.get("status"),
-                "episodes": entry.get("episodes"),
-                "duration": entry.get("duration"),
-                "genres": entry.get("genres") or [],
-                "tags": entry.get("tags") or [],
-                "year": entry.get("year"),
-                "averageScore": entry.get("averageScore"),
+                "episodes": entry.get("episode_count"),
+                "duration": minutes,
+                "countryOfOrigin": entry.get("country_of_origin"),
+                "averageScore": entry.get("average_score"),
                 "popularity": entry.get("popularity"),
                 "season": entry.get("season"),
-                "nextAiring": entry.get("nextAiring"),
+                "seasonYear": entry.get("season_year"),
+                "nextAiring": entry.get("next_airing"),
+                # The catalogue carries no genre: the filters on genre cannot
+                # work on this fallback.
+                "genres": [],
+                "tags": [],
             }
         )
-    return {"data": entries, "count": entries.__len__(), "catalogue": "miruro"}
+    return {"data": entries, "count": len(entries), "catalogue": "miruro"}
 
 
 @app.get("/search")
