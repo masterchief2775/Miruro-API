@@ -892,12 +892,16 @@ async def catalogue_search(
     par AniList pour resoudre les identifiants : elles tombent avec lui.
     """
     try:
-        result = await _catalog_get(f"/anime?q={quote(query)}&limit={limit}&sort=-popularity")
-    except HTTPException as err:
+        # The catalogue refuses a query without `limit` ("Unsupported catalog
+        # request"), and it seems to want more than a handful: the same URL
+        # with limit=3 answers 400 and with limit=15 answers 200. The limit
+        # asked for is applied afterwards.
+        result = await _catalog_get(f"/anime?q={quote(query)}&limit=15&sort=-popularity")
+    except HTTPException:
         raise HTTPException(status_code=502, detail={"message": "Le catalogue ne repond pas"})
 
     entries = []
-    for entry in result.get("data", []):
+    for entry in result.get("data", [])[:limit]:
         anilist_ids = (entry.get("external_ids") or {}).get("anilist") or []
         if not anilist_ids:
             continue
