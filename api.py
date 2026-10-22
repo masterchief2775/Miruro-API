@@ -33,10 +33,20 @@ async def kuhi_proxy(path: str, request: Request):
             )
     except Exception as exc:
         raise HTTPException(status_code=502, detail={"message": f"source kuhi injoignable: {exc}"})
+    content = res.content
+    media_type = res.headers.get("content-type", "application/json")
+    # The playlists of the Kuhi point at their own paths ("/proxy_segment",
+    # "/proxy_m3u8"), which are relative to the root of ITS API. Behind the
+    # relay they have to carry the prefix, or the browser asks for a path
+    # that does not exist -- and the video never starts.
+    if "mpegurl" in media_type:
+        content = res.content.replace(b"\n/proxy_", b"\n/kuhi/proxy_")
+        if content.startswith(b"/proxy_"):
+            content = b"/kuhi" + content
     return Response(
-        content=res.content,
+        content=content,
         status_code=res.status_code,
-        media_type=res.headers.get("content-type", "application/json"),
+        media_type=media_type,
     )
 
 
