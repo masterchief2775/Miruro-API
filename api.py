@@ -1,7 +1,7 @@
 import base64, json, gzip, httpx, os, re, time
 from urllib.parse import quote, urljoin
 from curl_cffi.requests import AsyncSession
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -10,6 +10,35 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI(title="Miruro API", version="2.0")
+
+# The second source, reached through the same address.
+#
+# The box forwards one port to this service; the Kuhi API listens on another
+# port of the Pi, which nothing outside the house reaches. Rather than ask
+# for another door -- and hope the provider does not filter that port --
+# the requests for /kuhi are forwarded to it from here, on the loopback.
+KUHI_BASE = os.environ.get("KUHI_BASE_URL", "http://127.0.0.1:8001")
+
+
+@app.api_route("/kuhi/{path:path}", methods=["GET", "POST", "OPTIONS"])
+async def kuhi_proxy(path: str, request: Request):
+    """One request, forwarded to the Kuhi API."""
+    url = f"{KUHI_BASE}/anime/{path}"
+    params = dict(request.query_params)
+    body = await request.body()
+    try:
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            res = await client.request(
+                request.method, url, params=params, content=body or None
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={"message": f"source kuhi injoignable: {exc}"})
+    return Response(
+        content=res.content,
+        status_code=res.status_code,
+        media_type=res.headers.get("content-type", "application/json"),
+    )
+
 
 app.add_middleware(
     CORSMiddleware,
