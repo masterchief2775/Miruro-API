@@ -23,7 +23,7 @@ KUHI_BASE = os.environ.get("KUHI_BASE_URL", "http://127.0.0.1:8001")
 @app.api_route("/kuhi/{path:path}", methods=["GET", "POST", "OPTIONS"])
 async def kuhi_proxy(path: str, request: Request):
     """One request, forwarded to the Kuhi API."""
-    url = f"{KUHI_BASE}/anime/{path}"
+    url = f"{KUHI_BASE}/{path}"
     params = dict(request.query_params)
     body = await request.body()
     try:
