@@ -102,6 +102,42 @@ CATALOG_KEY = b"miruro/catalog"
 _CATALOG_CACHE = {}
 _CATALOG_CACHE_TTL = 300  # seconds
 
+# The catalogue's answers are also kept ON DISK.
+#
+# The catalogue is behind a CDN that refuses an address which asks too much,
+# the way AniList does. When it refuses, the cache is all that stands between
+# the application and an empty catalogue -- and a cache that lives in memory
+# dies with the service. On disk, a restart does not empty it.
+_CATALOG_CACHE_PATH = os.environ.get(
+    "CATALOG_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalogue-cache.json"),
+)
+_CATALOG_CACHE_DISK_TTL = 6 * 3600  # six heures
+
+
+def _cache_load_disk():
+    try:
+        with open(_CATALOG_CACHE_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        now = time.time()
+        for key, entry in (raw or {}).items():
+            expires, value = entry
+            if now < expires:
+                _CATALOG_CACHE[key] = (expires, value)
+    except Exception:
+        pass
+
+
+def _cache_save_disk():
+    try:
+        tmp = _CATALOG_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({k: [v[0], v[1]] for k, v in _CATALOG_CACHE.items()}, fh)
+        os.replace(tmp, _CATALOG_CACHE_PATH)
+    except Exception:
+        # The cache is an optimisation, never a reason to fail.
+        pass
+
 
 def _cache_get(key: str):
     entry = _CATALOG_CACHE.get(key)
@@ -116,7 +152,11 @@ def _cache_get(key: str):
 
 def _cache_set(key: str, value):
     _CATALOG_CACHE[key] = (time.time() + _CATALOG_CACHE_TTL, value)
+    _cache_save_disk()
     return value
+
+
+_cache_load_disk()
 
 
 async def _catalog_get(path: str, cache: bool = True) -> dict:
