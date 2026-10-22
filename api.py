@@ -40,7 +40,12 @@ async def kuhi_proxy(path: str, request: Request):
     # relay they have to carry the prefix, or the browser asks for a path
     # that does not exist -- and the video never starts.
     if "mpegurl" in media_type:
-        content = res.content.replace(b"\n/proxy_", b"\n/kuhi/proxy_")
+        # The standalone lines and the URI attributes of the tags alike.
+        content = res.content.replace(b'"/proxy_m3u8?', b'"/kuhi/proxy_m3u8?')
+        content = content.replace(b'"/proxy_segment?', b'"/kuhi/proxy_segment?')
+        content = content.replace(b"URI=/proxy_m3u8?", b"URI=/kuhi/proxy_m3u8?")
+        content = content.replace(b"URI=/proxy_segment?", b"URI=/kuhi/proxy_segment?")
+        content = content.replace(b"\n/proxy_", b"\n/kuhi/proxy_")
         if content.startswith(b"/proxy_"):
             content = b"/kuhi" + content
     return Response(
